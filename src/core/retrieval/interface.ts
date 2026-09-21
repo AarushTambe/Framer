@@ -1,7 +1,8 @@
-// src/core/retrieval/interface.ts
 export interface SearchResult {
     path: string;
-    snippet: string;
+    startLine: number;
+    endLine: number;
+    content: string;
     score: number;
 }
 

@@ -1,55 +1,94 @@
-// src/core/context/engine.ts
 import fs from 'fs';
 import path from 'path';
-import { FTS5Retriever } from '../retrieval/fts5';
+import { Retriever, SearchResult } from '../retrieval/interface';
+import { getConfig } from '../config';
 
-export function generateContext(repoRoot: string, task: string): string {
-    const stateFiles = ['project.md', 'tasks.md', 'decisions.md'];
-    const stateContent = stateFiles
-        .map(f => {
-            const fp = path.join(repoRoot, '.framer', f);
-            return fs.existsSync(fp) ? `### ${f}\n${fs.readFileSync(fp, 'utf-8')}` : '';
-        })
-        .filter(Boolean)
-        .join('\n\n');
+export interface ContextPackage {
+    task: string;
+    stateContent: string;
+    chunks: SearchResult[];
+    budgetInfo: {
+        budgetTokens: number;
+        stateTokens: number;
+        codeTokens: number;
+        totalTokens: number;
+    };
+}
 
-    // Retrieve configurable token budget
-    let config = { tokenBudget: 12000 };
-    try {
-        const configPath = path.join(repoRoot, '.framer', 'config.json');
-        if (fs.existsSync(configPath)) {
-            config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        }
-    } catch (e) {}
+export class ContextEngine {
+    constructor(private repoRoot: string, private retriever: Retriever) {}
 
-    const maxBudget = config.tokenBudget; 
-    const stateLen = stateContent.length;
-
-    const retriever = new FTS5Retriever(repoRoot);
-    const searchResults = retriever.search(task, 10);
-
-    let codeContext = '### RELEVANT CODE\n\n';
-    let currentLen = stateLen + codeContext.length;
-
-    for (const result of searchResults) {
-        const filePath = path.join(repoRoot, result.path);
-        if (!fs.existsSync(filePath)) continue;
-        const fileContent = fs.readFileSync(filePath, 'utf-8');
-        
-        const snippetToAdd = `#### ${result.path}\n\`\`\`\n${fileContent}\n\`\`\`\n\n`;
-        
-        // Push full file if budget allows; push snippet summary if constrained
-        if (currentLen + snippetToAdd.length > maxBudget) {
-            const fallbackSnippet = `#### ${result.path} (Summary)\n\`\`\`\n${result.snippet}\n\`\`\`\n\n`;
-            if (currentLen + fallbackSnippet.length <= maxBudget) {
-                codeContext += fallbackSnippet;
-                currentLen += fallbackSnippet.length;
-            }
-        } else {
-            codeContext += snippetToAdd;
-            currentLen += snippetToAdd.length;
-        }
+    // V1 Token Estimate: 1 token ≈ 4 characters
+    private estimateTokens(text: string): number {
+        return Math.ceil(text.length / 4);
     }
 
-    return `## FRAMER CONTEXT\n\n## TASK\n${task}\n\n## STATE\n${stateContent}\n\n${codeContext}`;
+    private getProjectState(): string {
+        const stateFiles = ['project.md', 'tasks.md', 'decisions.md'];
+        return stateFiles
+            .map(f => {
+                const fp = path.join(this.repoRoot, '.framer', f);
+                return fs.existsSync(fp) ? `### ${f}\n${fs.readFileSync(fp, 'utf-8')}` : '';
+            })
+            .filter(Boolean)
+            .join('\n\n');
+    }
+
+    generateContext(task: string): ContextPackage {
+        const config = getConfig(this.repoRoot);
+        const budgetTokens = config.tokenBudget || 12000;
+        
+        let stateContent = this.getProjectState();
+        let stateTokens = this.estimateTokens(stateContent);
+        
+        // Truncate state if it exceeds the budget
+        if (stateTokens > budgetTokens) {
+            const truncMsg = "\n... [State truncated due to budget constraints]";
+            const truncMsgTokens = this.estimateTokens(truncMsg);
+            const allowedStateTokens = Math.max(0, budgetTokens - truncMsgTokens);
+            const allowedChars = allowedStateTokens * 4;
+            
+            if (allowedChars > 0) {
+                stateContent = stateContent.substring(0, allowedChars) + truncMsg;
+            } else {
+                stateContent = truncMsg; // Extreme constraint fallback
+            }
+            
+            stateTokens = this.estimateTokens(stateContent);
+            if (stateTokens > budgetTokens) stateTokens = budgetTokens; // Safety ceiling
+        }
+
+        const remainingTokens = Math.max(0, budgetTokens - stateTokens);
+        const selectedChunks: SearchResult[] = [];
+        let codeTokens = 0;
+
+        if (remainingTokens > 0) {
+            // No hardcoded 50 limit, purely dynamic based on budget
+            const candidates = this.retriever.search(task);
+            
+            for (const chunk of candidates) {
+                const chunkText = `#### ${chunk.path} (Lines ${chunk.startLine}-${chunk.endLine})\n\`\`\`\n${chunk.content}\n\`\`\`\n\n`;
+                const chunkTokens = this.estimateTokens(chunkText);
+                
+                if (codeTokens + chunkTokens <= remainingTokens) {
+                    selectedChunks.push(chunk);
+                    codeTokens += chunkTokens;
+                } else {
+                    break; // Budget exhausted
+                }
+            }
+        }
+
+        return {
+            task,
+            stateContent,
+            chunks: selectedChunks,
+            budgetInfo: {
+                budgetTokens,
+                stateTokens,
+                codeTokens,
+                totalTokens: stateTokens + codeTokens
+            }
+        };
+    }
 }
