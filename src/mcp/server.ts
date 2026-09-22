@@ -1,4 +1,3 @@
-// src/mcp/server.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerMcpTools } from "./tools";
@@ -14,8 +13,6 @@ export async function runMcpServer(repoRoot: string) {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     
-    process.stdin.on("close", () => {
-        server.close();
-        process.exit(0);
-    });
+    // Diagnostic logging MUST use stderr to preserve stdout for JSON-RPC
+    console.error("Framer MCP Server initialized on stdio");
 }

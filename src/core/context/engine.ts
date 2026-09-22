@@ -1,7 +1,6 @@
-import fs from 'fs';
-import path from 'path';
 import { Retriever, SearchResult } from '../retrieval/interface';
 import { getConfig } from '../config';
+import { getProjectState } from '../state/index';
 
 export interface ContextPackage {
     task: string;
@@ -23,22 +22,11 @@ export class ContextEngine {
         return Math.ceil(text.length / 4);
     }
 
-    private getProjectState(): string {
-        const stateFiles = ['project.md', 'tasks.md', 'decisions.md'];
-        return stateFiles
-            .map(f => {
-                const fp = path.join(this.repoRoot, '.framer', f);
-                return fs.existsSync(fp) ? `### ${f}\n${fs.readFileSync(fp, 'utf-8')}` : '';
-            })
-            .filter(Boolean)
-            .join('\n\n');
-    }
-
     generateContext(task: string): ContextPackage {
         const config = getConfig(this.repoRoot);
         const budgetTokens = config.tokenBudget || 12000;
         
-        let stateContent = this.getProjectState();
+        let stateContent = getProjectState(this.repoRoot);
         let stateTokens = this.estimateTokens(stateContent);
         
         // Truncate state if it exceeds the budget
