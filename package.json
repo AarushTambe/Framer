@@ -21,7 +21,10 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^13.0.3",
     "commander": "^11.0.0",
-    "ignore": "^5.3.0"
+    "ignore": "^5.3.0",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-typescript": "^0.23.2",
+    "ts-morph": "^28.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",

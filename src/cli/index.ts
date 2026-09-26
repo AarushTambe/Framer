@@ -7,6 +7,7 @@ import { runSearch } from './commands/search';
 import { runContext } from './commands/context';
 import { runSetup } from './commands/setup';
 import { runMcp } from './commands/mcp';
+import { runExplain } from './commands/explain';
 
 const program = new Command();
 program.version('1.0.0').description('Framer CLI - Local AI Context System');
@@ -32,6 +33,11 @@ program.command('search <query>')
 program.command('context <task>')
     .description('Generate context package for a specific task')
     .action((task) => runContext(getRoot(), task));
+
+program.command('explain <task>')
+    .description('Analyze a feature request and determine the implementation surface and context')
+    .option('--json', 'Output structured machine-consumable JSON')
+    .action((task, options) => runExplain(getRoot(), task, options));
 
 program.command('setup')
     .description('Print the configuration for AI clients')

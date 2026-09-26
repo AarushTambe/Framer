@@ -1,1 +1,4 @@
 node_modules/ 
+dist/
+# Framer Cache
+.framer/index.db
