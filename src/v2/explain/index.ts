@@ -43,6 +43,10 @@ export interface LineRange {
     reason: string;
 }
 
+export interface LineRangeSnippet extends LineRange {
+    content: string;
+}
+
 export interface FileSurfaceEntry {
     filePath: string;
     roles: SurfaceRole[];
@@ -63,6 +67,44 @@ export interface TaskInterpretation {
     detectedAreas: string[];
 }
 
+export interface ImplementationPacket {
+    task: string;
+    projectState: string;
+    targetSurface: {
+        primaryTargets: {
+            filePath: string;
+            role: 'LIKELY_MODIFICATION_TARGET';
+            symbolsToModifyOrExtend: SymbolRecord[];
+            codeRanges: LineRangeSnippet[];
+        }[];
+        relevantContext?: {
+            filePath: string;
+            role: 'RELEVANT_CONTEXT';
+            relevantSymbols: SymbolRecord[];
+            codeRanges: LineRangeSnippet[];
+        }[];
+        dependencies: {
+            filePath: string;
+            role: 'DEPENDENCY';
+            providedSymbols: SymbolRecord[];
+            codeRanges: LineRangeSnippet[];
+        }[];
+        callersAndEntryPoints: {
+            filePath: string;
+            role: 'REVERSE_DEPENDENCY' | 'ARCHITECTURAL_ENTRY_POINT';
+            invocationSites: LineRangeSnippet[];
+        }[];
+        testTargets: {
+            filePath: string;
+            role: 'TEST_TARGET';
+            relationship: 'direct_import' | 'transitive_import' | 'naming_convention';
+            assertionRanges: LineRangeSnippet[];
+        }[];
+    };
+    architecturalInvariants: string[];
+    budgetInfo: ContextPackage['budgetInfo'];
+}
+
 export interface ExplainResult {
     task: string;
     interpretation: TaskInterpretation;
@@ -73,7 +115,7 @@ export interface ExplainResult {
     dependencies: ImportEdge[];
     reverseDependencies: ImportEdge[];
     tests: RelatedTestRecord[];
-    contextPackage: ContextPackage;
+    implementationPacket: ImplementationPacket;
 }
 
 const STOP_WORDS = new Set([
@@ -86,6 +128,9 @@ const STOP_WORDS = new Set([
     'section', 'sections', 'relevant', 'analyzes', 'identifies', 'identify',
     'analyze', 'framer'
 ]);
+
+const RANGE_MERGE_GAP_LINES = 3;
+const COMPACT_CALLER_OR_TEST_MAX_LINES = 35;
 
 function splitIdentifierTokens(identifier: string): string[] {
     return identifier
@@ -109,6 +154,19 @@ class SurfaceScopedRetriever implements Retriever {
     }
 }
 
+interface CandidateChunk extends SearchResult {
+    reason: string;
+}
+
+interface PacketSelectionPlan {
+    primaryFiles: FileSurfaceEntry[];
+    relevantContextFiles: FileSurfaceEntry[];
+    dependencyFiles: FileSurfaceEntry[];
+    callerAndEntryFiles: FileSurfaceEntry[];
+    testFiles: FileSurfaceEntry[];
+    chunks: CandidateChunk[];
+}
+
 export class ExplainEngine {
     private intelligence: RepositoryIntelligenceService;
     private lexicalRetriever: FTS5Retriever;
@@ -124,8 +182,7 @@ export class ExplainEngine {
         this.lexicalRetriever = options?.lexicalRetriever ?? new FTS5Retriever(repoRoot);
     }
 
-    public explain(task: string, options?: { maxSeedFiles?: number }): ExplainResult {
-        const maxSeeds = options?.maxSeedFiles ?? 6;
+    public explain(task: string): ExplainResult {
         const trackedFiles = this.intelligence.getTrackedFiles();
 
         const isTestFile = (p: string): boolean =>
@@ -136,6 +193,15 @@ export class ExplainEngine {
 
         // 1. Task Interpretation
         const interpretation = this.interpretTask(task, trackedFiles);
+        const termSet = new Set(interpretation.extractedTerms);
+        const rawLower = task.toLowerCase();
+        const explicitlyTargetsCli =
+            termSet.has('cli') ||
+            termSet.has('command') ||
+            termSet.has('commands') ||
+            rawLower.includes('framer ');
+        const explicitlyTargetsMcp =
+            termSet.has('mcp') || termSet.has('tool') || termSet.has('tools');
 
         interface MutableSurface {
             filePath: string;
@@ -143,6 +209,8 @@ export class ExplainEngine {
             evidenceMap: Map<string, EvidenceRecord>;
             symbolsMap: Map<string, SymbolRecord>;
             ranges: LineRange[];
+            primaryScore: number;
+            definedSymbolMatches: number;
         }
 
         const surfaceMap = new Map<string, MutableSurface>();
@@ -156,17 +224,27 @@ export class ExplainEngine {
                     evidenceMap: new Map<string, EvidenceRecord>(),
                     symbolsMap: new Map<string, SymbolRecord>(),
                     ranges: [],
+                    primaryScore: 0,
+                    definedSymbolMatches: 0,
                 };
                 surfaceMap.set(posix, entry);
             }
             return entry;
         };
 
-        const addEvidence = (filePath: string, record: EvidenceRecord) => {
+        const addEvidence = (
+            filePath: string,
+            record: EvidenceRecord,
+            isPrimary: boolean = false,
+            dedupeKey?: string
+        ) => {
             const entry = getOrCreateSurface(filePath);
-            const key = `${record.signal}:${record.description}`;
+            const key = dedupeKey ?? `${record.signal}:${record.description}`;
             if (!entry.evidenceMap.has(key)) {
                 entry.evidenceMap.set(key, record);
+                if (isPrimary) {
+                    entry.primaryScore += record.weight;
+                }
             }
         };
 
@@ -175,11 +253,15 @@ export class ExplainEngine {
         for (const hit of fullTaskHits) {
             const normPath = toPosixPath(hit.path);
             if (!trackedFiles.includes(normPath)) continue;
-            addEvidence(normPath, {
-                signal: 'lexical_match',
-                description: `Matched full task query in FTS5 index (lines ${hit.startLine}-${hit.endLine})`,
-                weight: 4,
-            });
+            addEvidence(
+                normPath,
+                {
+                    signal: 'lexical_match',
+                    description: `Matched full task query in FTS5 index (lines ${hit.startLine}-${hit.endLine})`,
+                    weight: 4,
+                },
+                true
+            );
             getOrCreateSurface(normPath).ranges.push({
                 startLine: hit.startLine,
                 endLine: Math.min(hit.endLine, hit.startLine + 60),
@@ -206,16 +288,18 @@ export class ExplainEngine {
         for (const [filePath, info] of termHitCounts.entries()) {
             const matchedList = Array.from(info.terms).sort();
             const weight = Math.min(6, matchedList.length * 1.5);
-            addEvidence(filePath, {
-                signal: 'lexical_match',
-                description: `FTS5 lexical match for task concept(s): ${matchedList.join(', ')}`,
-                weight,
-            });
+            addEvidence(
+                filePath,
+                {
+                    signal: 'lexical_match',
+                    description: `FTS5 lexical match for task concept(s): ${matchedList.join(', ')}`,
+                    weight,
+                },
+                true
+            );
         }
 
         // 3. Candidate Discovery via Phase 2 Path & Symbol Matching
-        const termSet = new Set(interpretation.extractedTerms);
-
         for (const relPath of trackedFiles) {
             const pathTokens = splitIdentifierTokens(relPath);
             const matchedPathTokens = pathTokens.filter((t) => termSet.has(t));
@@ -225,11 +309,15 @@ export class ExplainEngine {
                 if (!interpretation.matchedPaths.includes(relPath)) {
                     interpretation.matchedPaths.push(relPath);
                 }
-                addEvidence(relPath, {
-                    signal: 'path_match',
-                    description: `File path matches task concept(s): ${uniquePathMatches.join(', ')}`,
-                    weight: uniquePathMatches.length * 2.5,
-                });
+                addEvidence(
+                    relPath,
+                    {
+                        signal: 'path_match',
+                        description: `File path matches task concept(s): ${uniquePathMatches.join(', ')}`,
+                        weight: uniquePathMatches.length * 2.5,
+                    },
+                    true
+                );
             }
 
             const fileSymbols = this.intelligence.getSymbolsInFile(relPath);
@@ -245,78 +333,136 @@ export class ExplainEngine {
                     }
                     const surf = getOrCreateSurface(relPath);
                     surf.symbolsMap.set(sym.id, sym);
+                    surf.definedSymbolMatches += 1;
                     surf.ranges.push({
                         startLine: sym.startLine,
                         endLine: sym.endLine,
                         reason: `Symbol definition ${sym.name} (${sym.kind})`,
                     });
 
-                    addEvidence(relPath, {
-                        signal: 'symbol_match',
-                        description: exactMatch
-                            ? `Defines symbol '${sym.name}' (${sym.kind}, lines ${sym.startLine}-${sym.endLine}) matching task term`
-                            : `Defines symbol '${sym.name}' (${sym.kind}, lines ${sym.startLine}-${sym.endLine}) overlapping task concept(s): ${Array.from(new Set(overlappingTokens)).join(', ')}`,
-                        weight: exactMatch ? 5 : overlappingTokens.length * 2,
-                    });
+                    const kindBonus =
+                        sym.kind === 'class' || sym.kind === 'interface' || sym.kind === 'method'
+                            ? 1.0
+                            : 0;
+
+                    addEvidence(
+                        relPath,
+                        {
+                            signal: 'symbol_match',
+                            description: exactMatch
+                                ? `Defines symbol '${sym.name}' (${sym.kind}, lines ${sym.startLine}-${sym.endLine}) matching task term`
+                                : `Defines symbol '${sym.name}' (${sym.kind}, lines ${sym.startLine}-${sym.endLine}) overlapping task concept(s): ${Array.from(new Set(overlappingTokens)).join(', ')}`,
+                            weight: (exactMatch ? 5 : overlappingTokens.length * 2) + kindBonus,
+                        },
+                        true
+                    );
                 }
             }
         }
 
-        // Structural analogue / Entry point discovery when task targets CLI commands or MCP tools
-        const rawLower = task.toLowerCase();
-        if (
-            termSet.has('cli') ||
-            termSet.has('command') ||
-            termSet.has('commands') ||
-            rawLower.includes('framer ')
-        ) {
+        // Structural analogue / Entry point discovery when task explicitly targets CLI or MCP
+        if (explicitlyTargetsCli) {
             if (trackedFiles.includes('src/cli/index.ts')) {
                 const entrySurf = getOrCreateSurface('src/cli/index.ts');
                 entrySurf.roles.add('ARCHITECTURAL_ENTRY_POINT');
                 entrySurf.roles.add('LIKELY_MODIFICATION_TARGET');
-                addEvidence('src/cli/index.ts', {
-                    signal: 'architectural_entry',
-                    description: 'Primary CLI entrypoint where commands are registered',
-                    weight: 5,
-                });
+                addEvidence(
+                    'src/cli/index.ts',
+                    {
+                        signal: 'architectural_entry',
+                        description: 'Primary CLI entrypoint where commands are registered',
+                        weight: 5,
+                    },
+                    true,
+                    'architectural_entry:src/cli/index.ts'
+                );
             }
             if (trackedFiles.includes('src/cli/commands/context.ts')) {
                 const peerSurf = getOrCreateSurface('src/cli/commands/context.ts');
                 peerSurf.roles.add('RELEVANT_CONTEXT');
-                addEvidence('src/cli/commands/context.ts', {
-                    signal: 'structural_peer',
-                    description: 'Existing CLI command handler demonstrating command-to-engine wiring pattern',
-                    weight: 3,
-                });
+                addEvidence(
+                    'src/cli/commands/context.ts',
+                    {
+                        signal: 'structural_peer',
+                        description:
+                            'Existing CLI command handler demonstrating command-to-engine wiring pattern',
+                        weight: 3,
+                    },
+                    true
+                );
             }
         }
 
-        if (termSet.has('mcp') || termSet.has('tool') || termSet.has('tools')) {
+        if (explicitlyTargetsMcp) {
             for (const mcpFile of ['src/mcp/tools.ts', 'src/mcp/server.ts']) {
                 if (trackedFiles.includes(mcpFile)) {
                     const mcpSurf = getOrCreateSurface(mcpFile);
                     mcpSurf.roles.add('ARCHITECTURAL_ENTRY_POINT');
-                    addEvidence(mcpFile, {
-                        signal: 'architectural_entry',
-                        description: 'MCP server/tool registration entrypoint matching task domain',
-                        weight: 4.5,
-                    });
+                    addEvidence(
+                        mcpFile,
+                        {
+                            signal: 'architectural_entry',
+                            description: 'MCP server/tool registration entrypoint matching task domain',
+                            weight: 4.5,
+                        },
+                        true,
+                        `architectural_entry:${mcpFile}`
+                    );
                 }
             }
         }
 
-        // 4. Select Top Non-Test Seed Candidates for Structural Graph Expansion
-        const preliminarySeeds = Array.from(surfaceMap.values())
-            .filter((s) => !isTestFile(s.filePath))
-            .map((s) => ({
-                surface: s,
-                seedScore: Array.from(s.evidenceMap.values()).reduce((acc, e) => acc + e.weight, 0),
-            }))
+        // 4. Select Primary Non-Test Seed Candidates without arbitrary culling
+        const allNonTestCandidates = Array.from(surfaceMap.values())
+            .filter((s) => !isTestFile(s.filePath) && s.primaryScore > 0)
             .sort((a, b) => {
-                if (b.seedScore !== a.seedScore) return b.seedScore - a.seedScore;
-                return a.surface.filePath.localeCompare(b.surface.filePath);
-            })
-            .slice(0, maxSeeds);
+                if (b.primaryScore !== a.primaryScore) return b.primaryScore - a.primaryScore;
+                return a.filePath.localeCompare(b.filePath);
+            });
+
+        const candidateMap = new Map<string, MutableSurface>();
+        for (const c of allNonTestCandidates) {
+            candidateMap.set(c.filePath, c);
+        }
+
+        const isDelegatingWrapper = (cand: MutableSurface): boolean => {
+            const isCliLayer = cand.filePath.startsWith('src/cli/');
+            const isMcpLayer = cand.filePath.startsWith('src/mcp/');
+
+            if (isCliLayer && explicitlyTargetsCli) return false;
+            if (isMcpLayer && explicitlyTargetsMcp) return false;
+            if (task.includes(cand.filePath)) return false;
+
+            for (const sym of cand.symbolsMap.values()) {
+                if (termSet.has(sym.name.toLowerCase())) {
+                    return false;
+                }
+            }
+
+            const outgoing = this.intelligence.getImportsOfFile(cand.filePath);
+            for (const imp of outgoing) {
+                if (imp.isExternal || !imp.resolvedFile) continue;
+                const importedTarget = candidateMap.get(imp.resolvedFile);
+                if (
+                    importedTarget &&
+                    importedTarget.primaryScore >= 4.0 &&
+                    (importedTarget.definedSymbolMatches > cand.definedSymbolMatches ||
+                        isCliLayer ||
+                        isMcpLayer)
+                ) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        const highConfidenceSeeds = allNonTestCandidates.filter(
+            (s) => s.primaryScore >= 4.0 && !isDelegatingWrapper(s)
+        );
+        const preliminarySeeds =
+            highConfidenceSeeds.length > 0
+                ? highConfidenceSeeds
+                : allNonTestCandidates.slice(0, 2);
 
         const allDependencies: ImportEdge[] = [];
         const allReverseDependencies: ImportEdge[] = [];
@@ -324,15 +470,17 @@ export class ExplainEngine {
         const allEntryPointsMap = new Map<string, EntryPointRecord>();
 
         for (const ep of this.intelligence.findArchitecturalEntryPoints()) {
-            if (surfaceMap.has(ep.filePath)) {
+            const surf = surfaceMap.get(ep.filePath);
+            if (surf && surf.primaryScore >= 4.0 && !isDelegatingWrapper(surf)) {
                 allEntryPointsMap.set(ep.filePath, ep);
-                getOrCreateSurface(ep.filePath).roles.add('ARCHITECTURAL_ENTRY_POINT');
+                surf.roles.add('ARCHITECTURAL_ENTRY_POINT');
             }
         }
 
         // 5. Structural Expansion via Phase 2 RepositoryIntelligenceService
-        for (const { surface: seed, seedScore } of preliminarySeeds) {
-            if (seedScore >= 3.5) {
+        for (const seed of preliminarySeeds) {
+            const isPrimaryTarget = seed.primaryScore >= 4.0 && !isDelegatingWrapper(seed);
+            if (isPrimaryTarget) {
                 seed.roles.add('LIKELY_MODIFICATION_TARGET');
             } else {
                 seed.roles.add('RELEVANT_CONTEXT');
@@ -350,15 +498,31 @@ export class ExplainEngine {
             const imports = this.intelligence.getImportsOfFile(seed.filePath);
             for (const imp of imports) {
                 if (imp.isExternal || !imp.resolvedFile) continue;
+
+                if (
+                    seed.filePath === 'src/cli/index.ts' &&
+                    imp.resolvedFile.startsWith('src/cli/commands/')
+                ) {
+                    const targetSurf = surfaceMap.get(imp.resolvedFile);
+                    if (!targetSurf || targetSurf.primaryScore === 0) {
+                        continue;
+                    }
+                }
+
                 allDependencies.push(imp);
 
                 const depSurf = getOrCreateSurface(imp.resolvedFile);
                 depSurf.roles.add('DEPENDENCY');
-                addEvidence(imp.resolvedFile, {
-                    signal: 'dependency',
-                    description: `Imported by candidate ${seed.filePath} (${imp.importedSymbols.join(', ') || imp.rawSpecifier})`,
-                    weight: 2.0,
-                });
+                addEvidence(
+                    imp.resolvedFile,
+                    {
+                        signal: 'dependency',
+                        description: `Imported by candidate ${seed.filePath} (${imp.importedSymbols.join(', ') || imp.rawSpecifier})`,
+                        weight: 2.0,
+                    },
+                    false,
+                    `dependency:${seed.filePath}->${imp.resolvedFile}`
+                );
 
                 const depSymbols = this.intelligence.getSymbolsInFile(imp.resolvedFile);
                 for (const depSym of depSymbols) {
@@ -381,71 +545,186 @@ export class ExplainEngine {
 
                 if (isTestFile(imp.fromFile)) {
                     revSurf.roles.add('TEST_TARGET');
-                    addEvidence(imp.fromFile, {
-                        signal: 'related_test',
-                        description: `Test file directly importing candidate ${seed.filePath}`,
-                        weight: 2.0,
-                    });
+                    addEvidence(
+                        imp.fromFile,
+                        {
+                            signal: 'related_test',
+                            description: `Test file directly importing candidate ${seed.filePath}`,
+                            weight: 2.0,
+                        },
+                        false,
+                        `related_test:${imp.fromFile}->${seed.filePath}`
+                    );
                 } else {
                     revSurf.roles.add('REVERSE_DEPENDENCY');
-                    addEvidence(imp.fromFile, {
-                        signal: 'reverse_dependency',
-                        description: `Imports candidate ${seed.filePath} (${imp.importedSymbols.join(', ') || imp.rawSpecifier})`,
-                        weight: 2.2,
-                    });
+                    addEvidence(
+                        imp.fromFile,
+                        {
+                            signal: 'reverse_dependency',
+                            description: `Imports candidate ${seed.filePath} (${imp.importedSymbols.join(', ') || imp.rawSpecifier})`,
+                            weight: 2.0,
+                        },
+                        false,
+                        `reverse_dependency:${imp.fromFile}->${seed.filePath}`
+                    );
                 }
             }
 
             // 5c. Cross-File Symbol References
-            for (const sym of Array.from(seed.symbolsMap.values()).slice(0, 4)) {
+            const seedSymbols = Array.from(seed.symbolsMap.values());
+            const perFileSymbolUsages = new Map<
+                string,
+                { sym: SymbolRecord; allLines: number[]; bodyLines: number[] }[]
+            >();
+
+            for (const sym of seedSymbols) {
                 const refs = this.intelligence.findSymbolReferences(sym.id);
+                const refsByFile = new Map<string, number[]>();
+
                 for (const ref of refs) {
                     if (ref.isDefinition || ref.referencingFile === seed.filePath) continue;
-                    const refSurf = getOrCreateSurface(ref.referencingFile);
-                    if (isTestFile(ref.referencingFile)) {
+                    let lines = refsByFile.get(ref.referencingFile);
+                    if (!lines) {
+                        lines = [];
+                        refsByFile.set(ref.referencingFile, lines);
+                    }
+                    if (!lines.includes(ref.line)) {
+                        lines.push(ref.line);
+                    }
+                }
+
+                for (const [refFile, lines] of refsByFile.entries()) {
+                    lines.sort((a, b) => a - b);
+                    const refSurf = getOrCreateSurface(refFile);
+                    if (isTestFile(refFile)) {
                         refSurf.roles.add('TEST_TARGET');
                     } else {
                         refSurf.roles.add('REVERSE_DEPENDENCY');
                     }
-                    addEvidence(ref.referencingFile, {
-                        signal: 'reference_match',
-                        description: `References symbol '${sym.name}' at line ${ref.line}`,
-                        weight: 1.8,
+
+                    const refFileImports = this.intelligence.getImportsOfFile(refFile);
+                    const importLines = new Set<number>(refFileImports.map((imp) => imp.line));
+                    const maxImportLine =
+                        refFileImports.length > 0
+                            ? Math.max(...refFileImports.map((imp) => imp.line))
+                            : 0;
+
+                    const bodyLines = lines.filter(
+                        (ln) => !importLines.has(ln) && ln > maxImportLine
+                    );
+
+                    let fileUsageList = perFileSymbolUsages.get(refFile);
+                    if (!fileUsageList) {
+                        fileUsageList = [];
+                        perFileSymbolUsages.set(refFile, fileUsageList);
+                    }
+                    fileUsageList.push({ sym, allLines: lines, bodyLines });
+
+                    const lineLabel =
+                        lines.length === 1 ? `line ${lines[0]}` : `lines ${lines.join(', ')}`;
+
+                    addEvidence(
+                        refFile,
+                        {
+                            signal: 'reference_match',
+                            description: `References symbol '${sym.name}' (${lineLabel})`,
+                            weight: 1.5,
+                        },
+                        false,
+                        `reference_match:${refFile}->${sym.id}`
+                    );
+                }
+            }
+
+            for (const [refFile, usageEntries] of perFileSymbolUsages.entries()) {
+                const refSurf = getOrCreateSurface(refFile);
+                const executableBodyUsages = usageEntries.filter(
+                    (u) =>
+                        u.bodyLines.length > 0 &&
+                        u.sym.kind !== 'interface' &&
+                        u.sym.kind !== 'type'
+                );
+                const activeBodyUsages =
+                    executableBodyUsages.length > 0
+                        ? executableBodyUsages
+                        : usageEntries.filter((u) => u.bodyLines.length > 0);
+
+                if (activeBodyUsages.length > 0) {
+                    for (const u of activeBodyUsages) {
+                        for (const usageLine of u.bodyLines) {
+                            refSurf.ranges.push({
+                                startLine: Math.max(1, usageLine - 5),
+                                endLine: usageLine + 12,
+                                reason: `Invokes/references ${u.sym.name} (line ${usageLine})`,
+                            });
+                        }
+                    }
+                } else if (refSurf.ranges.length === 0 && usageEntries.length > 0) {
+                    const firstEntry = usageEntries[0];
+                    const fallbackLine = firstEntry.allLines[0];
+                    refSurf.ranges.push({
+                        startLine: Math.max(1, fallbackLine - 2),
+                        endLine: fallbackLine + 8,
+                        reason: `References ${firstEntry.sym.name} (line ${fallbackLine})`,
                     });
                 }
             }
 
             // 5d. Related Tests
-            const relatedTests = this.intelligence.findRelatedTests(seed.filePath);
-            for (const testRec of relatedTests) {
-                if (!allTestsMap.has(testRec.testFile)) {
-                    allTestsMap.set(testRec.testFile, testRec);
+            if (isPrimaryTarget) {
+                const relatedTests = this.intelligence.findRelatedTests(seed.filePath);
+                for (const testRec of relatedTests) {
+                    const existingTest = allTestsMap.get(testRec.testFile);
+                    if (!existingTest || testRec.relationship === 'direct_import') {
+                        allTestsMap.set(testRec.testFile, testRec);
+                    }
+                    const testSurf = getOrCreateSurface(testRec.testFile);
+                    testSurf.roles.add('TEST_TARGET');
+                    addEvidence(
+                        testRec.testFile,
+                        {
+                            signal: 'related_test',
+                            description: `Related test (${testRec.relationship}) for ${seed.filePath}`,
+                            weight: testRec.relationship === 'direct_import' ? 2.0 : 1.0,
+                        },
+                        false,
+                        `related_test:${testRec.testFile}->${seed.filePath}`
+                    );
                 }
-                const testSurf = getOrCreateSurface(testRec.testFile);
-                testSurf.roles.add('TEST_TARGET');
-                addEvidence(testRec.testFile, {
-                    signal: 'related_test',
-                    description: `Related test (${testRec.relationship}) for ${seed.filePath}`,
-                    weight: testRec.relationship === 'direct_import' ? 2.0 : 1.2,
-                });
             }
 
             // 5e. Architectural Entry Points
-            const connectedEntries = this.intelligence.findArchitecturalEntryPoints(seed.filePath);
-            for (const ep of connectedEntries) {
-                allEntryPointsMap.set(ep.filePath, ep);
-                const epSurf = getOrCreateSurface(ep.filePath);
-                epSurf.roles.add('ARCHITECTURAL_ENTRY_POINT');
-                addEvidence(ep.filePath, {
-                    signal: 'architectural_entry',
-                    description: `${ep.reason} (connected to ${seed.filePath})`,
-                    weight: 2.0,
-                });
+            if (isPrimaryTarget) {
+                const connectedEntries = this.intelligence.findArchitecturalEntryPoints(
+                    seed.filePath
+                );
+                for (const ep of connectedEntries) {
+                    allEntryPointsMap.set(ep.filePath, ep);
+                    const epSurf = getOrCreateSurface(ep.filePath);
+                    epSurf.roles.add('ARCHITECTURAL_ENTRY_POINT');
+                    addEvidence(
+                        ep.filePath,
+                        {
+                            signal: 'architectural_entry',
+                            description: `${ep.reason} (connected to ${seed.filePath})`,
+                            weight: 1.5,
+                        },
+                        false,
+                        `architectural_entry:${ep.filePath}`
+                    );
+                }
             }
         }
 
         // 6. Finalize Deterministic Ranking & Surface Entries
-        const rankedFiles: FileSurfaceEntry[] = [];
+        interface ScoredSurfaceEntry {
+            entry: FileSurfaceEntry;
+            primaryScore: number;
+            definedSymbolMatches: number;
+            roleTier: number;
+        }
+
+        const scoredEntries: ScoredSurfaceEntry[] = [];
 
         for (const surf of surfaceMap.values()) {
             if (surf.roles.size === 0) {
@@ -457,21 +736,46 @@ export class ExplainEngine {
                 return a.description.localeCompare(b.description);
             });
 
-            const rawScore = evidence.reduce((sum, ev) => sum + ev.weight, 0);
-            const score = Math.round(rawScore * 100) / 100;
+            const secondaryScore = evidence
+                .filter(
+                    (e) =>
+                        e.signal !== 'lexical_match' &&
+                        e.signal !== 'path_match' &&
+                        e.signal !== 'symbol_match' &&
+                        e.signal !== 'structural_peer'
+                )
+                .reduce((sum, ev) => sum + ev.weight, 0);
+
+            const effectiveTotal = surf.primaryScore + Math.min(6.0, secondaryScore);
+            const score = Math.round(effectiveTotal * 100) / 100;
 
             const fileSymbols = Array.from(surf.symbolsMap.values()).sort((a, b) => {
                 if (a.startLine !== b.startLine) return a.startLine - b.startLine;
                 return a.id.localeCompare(b.id);
             });
 
-            if (fileSymbols.length === 0) {
+            const shouldIncludeSymbolDefinitions =
+                surf.roles.has('LIKELY_MODIFICATION_TARGET') ||
+                surf.roles.has('RELEVANT_CONTEXT') ||
+                surf.roles.has('DEPENDENCY');
+
+            if (
+                fileSymbols.length === 0 &&
+                shouldIncludeSymbolDefinitions &&
+                !isTestFile(surf.filePath)
+            ) {
                 for (const s of this.intelligence.getSymbolsInFile(surf.filePath)) {
                     if (s.exported) fileSymbols.push(s);
                 }
             }
 
-            const ranges = this.consolidateRanges(surf.filePath, surf.ranges, fileSymbols);
+            const ranges = this.consolidateRanges(
+                surf.filePath,
+                surf.ranges,
+                fileSymbols,
+                isTestFile(surf.filePath),
+                shouldIncludeSymbolDefinitions
+            );
 
             const fileDeps = this.intelligence
                 .getImportsOfFile(surf.filePath)
@@ -493,34 +797,56 @@ export class ExplainEngine {
 
             const roleOrder: SurfaceRole[] = [
                 'LIKELY_MODIFICATION_TARGET',
-                'ARCHITECTURAL_ENTRY_POINT',
                 'RELEVANT_CONTEXT',
-                'REVERSE_DEPENDENCY',
                 'DEPENDENCY',
+                'REVERSE_DEPENDENCY',
+                'ARCHITECTURAL_ENTRY_POINT',
                 'TEST_TARGET',
             ];
             const orderedRoles = roleOrder.filter((r) => surf.roles.has(r));
 
-            rankedFiles.push({
-                filePath: surf.filePath,
-                roles: orderedRoles,
-                score,
-                evidence,
-                relevantSymbols: fileSymbols,
-                relevantRanges: ranges,
-                dependencies: fileDeps,
-                reverseDependencies: fileRevDeps,
-                relatedTests: fileTests,
+            let roleTier = 5;
+            if (surf.roles.has('LIKELY_MODIFICATION_TARGET')) {
+                roleTier = 1;
+            } else if (surf.roles.has('RELEVANT_CONTEXT')) {
+                roleTier = 2;
+            } else if (surf.roles.has('DEPENDENCY') || surf.roles.has('REVERSE_DEPENDENCY')) {
+                roleTier = 3;
+            } else if (surf.roles.has('ARCHITECTURAL_ENTRY_POINT')) {
+                roleTier = 4;
+            } else if (surf.roles.has('TEST_TARGET')) {
+                roleTier = 5;
+            }
+
+            scoredEntries.push({
+                entry: {
+                    filePath: surf.filePath,
+                    roles: orderedRoles,
+                    score,
+                    evidence,
+                    relevantSymbols: fileSymbols,
+                    relevantRanges: ranges,
+                    dependencies: fileDeps,
+                    reverseDependencies: fileRevDeps,
+                    relatedTests: fileTests,
+                },
+                primaryScore: surf.primaryScore,
+                definedSymbolMatches: surf.definedSymbolMatches,
+                roleTier,
             });
         }
 
-        rankedFiles.sort((a, b) => {
-            const aIsOnlyTest = a.roles.length === 1 && a.roles[0] === 'TEST_TARGET' ? 1 : 0;
-            const bIsOnlyTest = b.roles.length === 1 && b.roles[0] === 'TEST_TARGET' ? 1 : 0;
-            if (aIsOnlyTest !== bIsOnlyTest) return aIsOnlyTest - bIsOnlyTest;
-            if (b.score !== a.score) return b.score - a.score;
-            return a.filePath.localeCompare(b.filePath);
+        scoredEntries.sort((a, b) => {
+            if (a.roleTier !== b.roleTier) return a.roleTier - b.roleTier;
+            if (b.primaryScore !== a.primaryScore) return b.primaryScore - a.primaryScore;
+            if (b.definedSymbolMatches !== a.definedSymbolMatches) {
+                return b.definedSymbolMatches - a.definedSymbolMatches;
+            }
+            if (b.entry.score !== a.entry.score) return b.entry.score - a.entry.score;
+            return a.entry.filePath.localeCompare(b.entry.filePath);
         });
+
+        const rankedFiles = scoredEntries.map((s) => s.entry);
 
         const likelyModificationTargets = rankedFiles
             .filter((f) => f.roles.includes('LIKELY_MODIFICATION_TARGET'))
@@ -529,8 +855,7 @@ export class ExplainEngine {
         const repositoryAreas = Array.from(
             new Set(
                 rankedFiles
-                    .filter((f) => !isTestFile(f.filePath))
-                    .slice(0, 8)
+                    .filter((f) => !isTestFile(f.filePath) && f.score >= 2.0)
                     .map((f) => {
                         const parts = f.filePath.split('/');
                         return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : parts[0];
@@ -542,11 +867,23 @@ export class ExplainEngine {
         interpretation.matchedPaths.sort();
         interpretation.matchedSymbols.sort();
 
-        // 7. Assemble Token-Budgeted Context by Reusing V1 ContextEngine
-        const surfaceChunks = this.buildSurfaceChunks(rankedFiles);
-        const scopedRetriever = new SurfaceScopedRetriever(surfaceChunks);
+        const dedupedDependencies = this.dedupeImportEdges(allDependencies);
+        const dedupedReverseDependencies = this.dedupeImportEdges(allReverseDependencies);
+
+        // 7. Single-Pass Role-Prioritized Selection, Internal V1 ContextEngine Budgeting,
+        // and Canonical ImplementationPacket Assembly
+        const selectionPlan = this.buildSurfaceSelectionPlan(rankedFiles, allTestsMap);
+        const scopedRetriever = new SurfaceScopedRetriever(selectionPlan.chunks);
         const contextEngine = new ContextEngine(this.repoRoot, scopedRetriever);
-        const contextPackage = contextEngine.generateContext(task);
+        const internalContextPackage = contextEngine.generateContext(task);
+
+        const implementationPacket = this.buildImplementationPacket(
+            task,
+            selectionPlan,
+            internalContextPackage,
+            allTestsMap,
+            dedupedDependencies
+        );
 
         return {
             task,
@@ -557,12 +894,12 @@ export class ExplainEngine {
             ),
             rankedFiles,
             likelyModificationTargets,
-            dependencies: this.dedupeImportEdges(allDependencies),
-            reverseDependencies: this.dedupeImportEdges(allReverseDependencies),
+            dependencies: dedupedDependencies,
+            reverseDependencies: dedupedReverseDependencies,
             tests: Array.from(allTestsMap.values()).sort((a, b) =>
                 a.testFile.localeCompare(b.testFile)
             ),
-            contextPackage,
+            implementationPacket,
         };
     }
 
@@ -610,26 +947,41 @@ export class ExplainEngine {
     private consolidateRanges(
         filePath: string,
         explicitRanges: LineRange[],
-        symbols: SymbolRecord[]
+        symbols: SymbolRecord[],
+        isTest: boolean,
+        includeSymbolDefinitions: boolean
     ): LineRange[] {
         const safeAbs = validateSafePath(this.repoRoot, filePath);
         if (!fs.existsSync(safeAbs)) return [];
         const totalLines = fs.readFileSync(safeAbs, 'utf-8').split('\n').length;
 
-        const candidates: LineRange[] = [...explicitRanges];
-        for (const sym of symbols.slice(0, 5)) {
-            candidates.push({
-                startLine: sym.startLine,
-                endLine: sym.endLine,
-                reason: `${sym.kind} ${sym.name}`,
-            });
+        let filteredExplicit = [...explicitRanges];
+        if (!includeSymbolDefinitions || isTest) {
+            const bodyInvocationRanges = filteredExplicit.filter((r) =>
+                r.reason.startsWith('Invokes/references')
+            );
+            if (bodyInvocationRanges.length > 0) {
+                filteredExplicit = bodyInvocationRanges;
+            }
+        }
+
+        const candidates: LineRange[] = [...filteredExplicit];
+
+        if (!isTest && includeSymbolDefinitions) {
+            for (const sym of symbols) {
+                candidates.push({
+                    startLine: sym.startLine,
+                    endLine: sym.endLine,
+                    reason: `${sym.kind} ${sym.name}`,
+                });
+            }
         }
 
         if (candidates.length === 0) {
             return [
                 {
                     startLine: 1,
-                    endLine: Math.min(totalLines, 60),
+                    endLine: Math.min(totalLines, isTest ? 30 : 45),
                     reason: 'Module overview & exports',
                 },
             ];
@@ -646,7 +998,7 @@ export class ExplainEngine {
         const merged: LineRange[] = [];
         for (const curr of sorted) {
             const prev = merged[merged.length - 1];
-            if (prev && curr.startLine <= prev.endLine + 3) {
+            if (prev && curr.startLine <= prev.endLine + RANGE_MERGE_GAP_LINES) {
                 prev.endLine = Math.max(prev.endLine, curr.endLine);
                 if (!prev.reason.includes(curr.reason)) {
                     prev.reason = `${prev.reason}; ${curr.reason}`;
@@ -656,20 +1008,112 @@ export class ExplainEngine {
             }
         }
 
-        return merged.slice(0, 4);
+        return merged;
     }
 
-    private buildSurfaceChunks(rankedFiles: FileSurfaceEntry[]): SearchResult[] {
-        const chunks: SearchResult[] = [];
+    private buildSurfaceSelectionPlan(
+        rankedFiles: FileSurfaceEntry[],
+        testsMap: Map<string, RelatedTestRecord>
+    ): PacketSelectionPlan {
+        const assignedFiles = new Set<string>();
 
-        for (const fileEntry of rankedFiles) {
+        const primaryFiles: FileSurfaceEntry[] = [];
+        for (const f of rankedFiles) {
+            if (f.roles.includes('LIKELY_MODIFICATION_TARGET')) {
+                primaryFiles.push(f);
+                assignedFiles.add(f.filePath);
+            }
+        }
+
+        const relevantContextFiles: FileSurfaceEntry[] = [];
+        for (const f of rankedFiles) {
+            if (assignedFiles.has(f.filePath)) continue;
+            if (
+                f.roles.includes('RELEVANT_CONTEXT') &&
+                f.evidence.some((e) => e.signal === 'structural_peer')
+            ) {
+                relevantContextFiles.push(f);
+                assignedFiles.add(f.filePath);
+            }
+        }
+
+        const dependencyFiles: FileSurfaceEntry[] = [];
+        for (const f of rankedFiles) {
+            if (assignedFiles.has(f.filePath)) continue;
+            if (f.roles.includes('DEPENDENCY')) {
+                dependencyFiles.push(f);
+                assignedFiles.add(f.filePath);
+            }
+        }
+
+        const callerAndEntryFiles: FileSurfaceEntry[] = [];
+        for (const f of rankedFiles) {
+            if (assignedFiles.has(f.filePath)) continue;
+            if (f.roles.includes('TEST_TARGET')) continue;
+
+            const hasCallerOrEntryRole =
+                f.roles.includes('REVERSE_DEPENDENCY') ||
+                f.roles.includes('ARCHITECTURAL_ENTRY_POINT');
+            if (!hasCallerOrEntryRole) continue;
+
+            const hasDirectStructuralSignal = f.evidence.some(
+                (e) =>
+                    e.signal === 'reverse_dependency' ||
+                    e.signal === 'reference_match' ||
+                    e.signal === 'architectural_entry'
+            );
+            if (hasDirectStructuralSignal) {
+                callerAndEntryFiles.push(f);
+                assignedFiles.add(f.filePath);
+            }
+        }
+
+        const directTestFiles: FileSurfaceEntry[] = [];
+        for (const f of rankedFiles) {
+            if (assignedFiles.has(f.filePath)) continue;
+            if (!f.roles.includes('TEST_TARGET')) continue;
+            const rec = testsMap.get(f.filePath);
+            if (rec?.relationship === 'direct_import') {
+                directTestFiles.push(f);
+                assignedFiles.add(f.filePath);
+            }
+        }
+
+        const orderedSelection = [
+            ...primaryFiles,
+            ...relevantContextFiles,
+            ...dependencyFiles,
+            ...callerAndEntryFiles,
+            ...directTestFiles,
+        ];
+
+        const chunks: CandidateChunk[] = [];
+        const seenChunkKeys = new Set<string>();
+
+        for (const fileEntry of orderedSelection) {
             const safeAbs = validateSafePath(this.repoRoot, fileEntry.filePath);
             if (!fs.existsSync(safeAbs)) continue;
             const lines = fs.readFileSync(safeAbs, 'utf-8').split('\n');
 
+            const isCallerOrTestOnly =
+                callerAndEntryFiles.includes(fileEntry) || directTestFiles.includes(fileEntry);
+
             for (const range of fileEntry.relevantRanges) {
                 const start = Math.max(1, range.startLine);
-                const end = Math.min(lines.length, range.endLine);
+                // Preserve full consolidated logical ranges for primary targets, relevant context,
+                // and dependencies; bound only callers/entry points and tests to compact windows.
+                const end = isCallerOrTestOnly
+                    ? Math.min(
+                          lines.length,
+                          range.endLine,
+                          start + COMPACT_CALLER_OR_TEST_MAX_LINES - 1
+                      )
+                    : Math.min(lines.length, range.endLine);
+
+                const key = `${fileEntry.filePath}:${start}-${end}`;
+                if (seenChunkKeys.has(key)) continue;
+                seenChunkKeys.add(key);
+
                 const snippet = lines.slice(start - 1, end).join('\n');
                 if (!snippet.trim()) continue;
 
@@ -679,17 +1123,183 @@ export class ExplainEngine {
                     endLine: end,
                     content: snippet,
                     score: fileEntry.score,
+                    reason: range.reason,
                 });
             }
         }
 
-        return chunks;
+        return {
+            primaryFiles,
+            relevantContextFiles,
+            dependencyFiles,
+            callerAndEntryFiles,
+            testFiles: directTestFiles,
+            chunks,
+        };
+    }
+
+    private buildImplementationPacket(
+        task: string,
+        plan: PacketSelectionPlan,
+        contextPackage: ContextPackage,
+        testsMap: Map<string, RelatedTestRecord>,
+        dependencies: ImportEdge[]
+    ): ImplementationPacket {
+        const budgetedByFile = new Map<string, LineRangeSnippet[]>();
+        const reasonLookup = new Map<string, string>();
+        for (const c of plan.chunks) {
+            reasonLookup.set(`${c.path}:${c.startLine}-${c.endLine}`, c.reason);
+        }
+
+        for (const chunk of contextPackage.chunks) {
+            let list = budgetedByFile.get(chunk.path);
+            if (!list) {
+                list = [];
+                budgetedByFile.set(chunk.path, list);
+            }
+            list.push({
+                startLine: chunk.startLine,
+                endLine: chunk.endLine,
+                reason:
+                    reasonLookup.get(`${chunk.path}:${chunk.startLine}-${chunk.endLine}`) ??
+                    'Relevant implementation range',
+                content: chunk.content,
+            });
+        }
+
+        const dedupeSymbols = (symbols: SymbolRecord[]): SymbolRecord[] => {
+            const seen = new Set<string>();
+            const out: SymbolRecord[] = [];
+            for (const s of symbols) {
+                if (!seen.has(s.id)) {
+                    seen.add(s.id);
+                    out.push(s);
+                }
+            }
+            return out;
+        };
+
+        const primaryTargets = plan.primaryFiles
+            .map((f) => ({
+                filePath: f.filePath,
+                role: 'LIKELY_MODIFICATION_TARGET' as const,
+                symbolsToModifyOrExtend: dedupeSymbols(f.relevantSymbols),
+                codeRanges: budgetedByFile.get(f.filePath) ?? [],
+            }))
+            .filter((t) => t.codeRanges.length > 0 || t.symbolsToModifyOrExtend.length > 0);
+
+        const relevantContext = plan.relevantContextFiles
+            .map((f) => ({
+                filePath: f.filePath,
+                role: 'RELEVANT_CONTEXT' as const,
+                relevantSymbols: dedupeSymbols(f.relevantSymbols),
+                codeRanges: budgetedByFile.get(f.filePath) ?? [],
+            }))
+            .filter((c) => c.codeRanges.length > 0 || c.relevantSymbols.length > 0);
+
+        const packetDependencies = plan.dependencyFiles
+            .map((f) => ({
+                filePath: f.filePath,
+                role: 'DEPENDENCY' as const,
+                providedSymbols: dedupeSymbols(f.relevantSymbols),
+                codeRanges: budgetedByFile.get(f.filePath) ?? [],
+            }))
+            .filter((d) => d.codeRanges.length > 0 || d.providedSymbols.length > 0);
+
+        const callersAndEntryPoints = plan.callerAndEntryFiles
+            .map((f) => ({
+                filePath: f.filePath,
+                role: (f.roles.includes('ARCHITECTURAL_ENTRY_POINT') &&
+                !f.roles.includes('REVERSE_DEPENDENCY')
+                    ? 'ARCHITECTURAL_ENTRY_POINT'
+                    : 'REVERSE_DEPENDENCY') as 'REVERSE_DEPENDENCY' | 'ARCHITECTURAL_ENTRY_POINT',
+                invocationSites: budgetedByFile.get(f.filePath) ?? [],
+            }))
+            .filter((c) => c.invocationSites.length > 0);
+
+        const testTargets = plan.testFiles
+            .map((f) => {
+                const rec = testsMap.get(f.filePath);
+                return {
+                    filePath: f.filePath,
+                    role: 'TEST_TARGET' as const,
+                    relationship: rec?.relationship ?? ('direct_import' as const),
+                    assertionRanges: budgetedByFile.get(f.filePath) ?? [],
+                };
+            })
+            .filter((t) => t.assertionRanges.length > 0);
+
+        const architecturalInvariants = this.deriveArchitecturalInvariants(
+            plan,
+            dependencies
+        );
+
+        const targetSurface: ImplementationPacket['targetSurface'] = {
+            primaryTargets,
+            dependencies: packetDependencies,
+            callersAndEntryPoints,
+            testTargets,
+        };
+
+        if (relevantContext.length > 0) {
+            targetSurface.relevantContext = relevantContext;
+        }
+
+        return {
+            task,
+            projectState: contextPackage.stateContent,
+            targetSurface,
+            architecturalInvariants,
+            budgetInfo: contextPackage.budgetInfo,
+        };
+    }
+
+    /**
+     * Derives strictly code-grounded architectural invariants (Retriever interface boundary,
+     * path-security containment, and token-budget contracts).
+     */
+    private deriveArchitecturalInvariants(
+        plan: PacketSelectionPlan,
+        dependencies: ImportEdge[]
+    ): string[] {
+        const invariants: string[] = [];
+        const primaryPaths = new Set(plan.primaryFiles.map((f) => f.filePath));
+        const depPaths = new Set(plan.dependencyFiles.map((f) => f.filePath));
+
+        if (
+            primaryPaths.has('src/core/context/engine.ts') ||
+            depPaths.has('src/core/retrieval/interface.ts')
+        ) {
+            invariants.push(
+                'Retriever Interface Boundary: ContextEngine (src/core/context/engine.ts) must remain decoupled from SQLite persistence and interact with retrieval strictly via the Retriever interface (src/core/retrieval/interface.ts).'
+            );
+        }
+
+        if (
+            depPaths.has('src/core/repository/paths.ts') ||
+            dependencies.some((d) => d.resolvedFile === 'src/core/repository/paths.ts')
+        ) {
+            invariants.push(
+                'Repository Path-Security Boundary: All repository file reads and path resolutions must enforce containment via validateSafePath / isPathInsideRepo (src/core/repository/paths.ts).'
+            );
+        }
+
+        if (
+            primaryPaths.has('src/core/context/engine.ts') ||
+            depPaths.has('src/core/config/index.ts')
+        ) {
+            invariants.push(
+                'Token Budget Contract: Context generation must enforce the configured tokenBudget ceiling from getConfig (src/core/config/index.ts) such that budgetInfo.totalTokens (stateTokens + codeTokens) never exceeds budgetInfo.budgetTokens.'
+            );
+        }
+
+        return invariants;
     }
 
     private dedupeImportEdges(edges: ImportEdge[]): ImportEdge[] {
         const map = new Map<string, ImportEdge>();
         for (const e of edges) {
-            const key = `${e.fromFile}->${e.resolvedFile ?? e.rawSpecifier}:${e.line}`;
+            const key = `${e.fromFile}->${e.resolvedFile ?? e.rawSpecifier}:${e.importedSymbols.join(',')}`;
             if (!map.has(key)) {
                 map.set(key, e);
             }

@@ -32,10 +32,20 @@ function snapshotSrcHashes(rootDir: string): Record<string, string> {
     return hashes;
 }
 
+function getAllPacketFilePaths(res: ReturnType<ExplainEngine['explain']>): string[] {
+    const ts = res.implementationPacket.targetSurface;
+    return [
+        ...ts.primaryTargets.map((t) => t.filePath),
+        ...(ts.relevantContext?.map((c) => c.filePath) ?? []),
+        ...ts.dependencies.map((d) => d.filePath),
+        ...ts.callersAndEntryPoints.map((c) => c.filePath),
+        ...ts.testTargets.map((t) => t.filePath),
+    ];
+}
+
 function runV2Phase3Tests() {
     console.log('=== Framer V2 Phase 3: Explain Engine Self-Hosting Tests ===\n');
 
-    // Ensure Framer's own index is initialized and up to date so V1 FTS5 lexical search is active
     runInit(REPO_ROOT);
     runIndex(REPO_ROOT);
 
@@ -107,17 +117,19 @@ function runV2Phase3Tests() {
         `[PASS] 3. Tests & Entry Points: Found ${res1.tests.length} related tests and ${res1.entryPoints.length} architectural entry points.`
     );
 
-    // Test 4: V1 ContextEngine Reuse & Token Budget Compliance
+    // Test 4: V1 ContextEngine Reuse & Token Budget Compliance via Canonical ImplementationPacket
+    const packetPaths1 = getAllPacketFilePaths(res1);
     assert(
-        res1.contextPackage.chunks.length > 0,
-        'Expected non-empty budgeted context chunks from V1 ContextEngine'
+        packetPaths1.length > 0,
+        'Expected non-empty budgeted implementation packet from V1 ContextEngine'
     );
     assert(
-        res1.contextPackage.budgetInfo.totalTokens <= res1.contextPackage.budgetInfo.budgetTokens,
-        'Context package exceeded configured token budget'
+        res1.implementationPacket.budgetInfo.totalTokens <=
+            res1.implementationPacket.budgetInfo.budgetTokens,
+        'ImplementationPacket exceeded configured token budget'
     );
     console.log(
-        `[PASS] 4. V1 ContextEngine Reuse: Assembled ${res1.contextPackage.chunks.length} code chunks using ${res1.contextPackage.budgetInfo.totalTokens}/${res1.contextPackage.budgetInfo.budgetTokens} tokens.`
+        `[PASS] 4. V1 ContextEngine Reuse: Assembled ${packetPaths1.length} packet files using ${res1.implementationPacket.budgetInfo.totalTokens}/${res1.implementationPacket.budgetInfo.budgetTokens} tokens.`
     );
 
     // Test 5: Determinism across repeated ExplainEngine runs
@@ -129,7 +141,38 @@ function runV2Phase3Tests() {
     );
     console.log('[PASS] 5. Determinism: Independent ExplainEngine runs produced byte-identical structured results.');
 
-    // Test 6: End-to-End CLI Execution (`framer explain "<task>"` and `framer explain "<task>" --json`)
+    // Test 6: Architectural Refinement (Primary Target Ranking, Genuine Entry Points, Scoped Context)
+    const res2 = engine.explain('change how context is generated');
+    assert(
+        res2.rankedFiles[0]?.filePath === 'src/core/context/engine.ts',
+        `Expected src/core/context/engine.ts to rank #1 for "change how context is generated", got ${res2.rankedFiles[0]?.filePath}`
+    );
+    const entryFiles2 = res2.entryPoints.map((e: EntryPointRecord) => e.filePath);
+    assert(
+        !entryFiles2.includes('src/v2/explain/index.ts'),
+        'Expected internal module src/v2/explain/index.ts NOT to be classified as an architectural entry point'
+    );
+    assert(
+        !entryFiles2.includes('src/cli/commands/explain.ts') &&
+            !entryFiles2.includes('src/cli/commands/mcp.ts'),
+        `Expected unrelated CLI commands not to appear in entryPoints, got ${entryFiles2.join(', ')}`
+    );
+    const packetPaths2 = getAllPacketFilePaths(res2);
+    assert(
+        packetPaths2.includes('src/core/context/engine.ts'),
+        'Expected primary target src/core/context/engine.ts in implementationPacket'
+    );
+    assert(
+        !packetPaths2.includes('src/cli/commands/explain.ts') &&
+            !packetPaths2.includes('src/cli/commands/mcp.ts') &&
+            !packetPaths2.includes('tests/v2_phase3.ts'),
+        `Expected peripheral files to be excluded from implementationPacket, got ${packetPaths2.join(', ')}`
+    );
+    console.log(
+        `[PASS] 6. Architectural Refinement: engine.ts ranked #1, non-entry index.ts excluded, and packet scoped to ${packetPaths2.length} high-signal files (${res2.implementationPacket.budgetInfo.totalTokens} tokens).`
+    );
+
+    // Test 7: End-to-End CLI Execution (`framer explain "<task>"` and `framer explain "<task>" --json`)
     const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
     const cliHumanOutput = execSync(
         `${npx} tsx "${CLI_PATH}" explain "Add a new MCP tool to registerMcpTools"`,
@@ -149,15 +192,15 @@ function runV2Phase3Tests() {
             parsedJson.rankedFiles.some((f: any) => f.filePath === 'src/mcp/tools.ts'),
         'CLI --json output did not contain machine-consumable rankedFiles with src/mcp/tools.ts'
     );
-    console.log('[PASS] 6. End-to-End CLI: `framer explain` human-readable and `--json` outputs verified.');
+    console.log('[PASS] 7. End-to-End CLI: `framer explain` human-readable and `--json` outputs verified.');
 
-    // Test 7: Source-Code Read-Only Immutability
+    // Test 8: Source-Code Read-Only Immutability
     const afterHashes = snapshotSrcHashes(REPO_ROOT);
     assert(
         JSON.stringify(beforeHashes) === JSON.stringify(afterHashes),
         'Source files in src/ were unexpectedly modified during explain execution'
     );
-    console.log('[PASS] 7. Source Immutability: Zero source files modified during analysis.');
+    console.log('[PASS] 8. Source Immutability: Zero source files modified during analysis.');
 
     console.log('\n=== Framer V2 Phase 3 Validation Complete ===');
 }

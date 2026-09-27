@@ -1,5 +1,12 @@
-﻿// src/cli/commands/explain.ts
-import { ExplainEngine } from '../../v2/explain/index';
+﻿import { ExplainEngine, LineRangeSnippet } from '../../v2/explain/index';
+
+function printCodeRanges(ranges: LineRangeSnippet[]) {
+    for (const r of ranges) {
+        console.log(`  // Lines ${r.startLine}-${r.endLine} (${r.reason})`);
+        console.log(r.content);
+        console.log('  ---');
+    }
+}
 
 export function runExplain(repoRoot: string, task: string, options?: { json?: boolean }) {
     const engine = new ExplainEngine(repoRoot);
@@ -81,12 +88,16 @@ export function runExplain(repoRoot: string, task: string, options?: { json?: bo
 
     console.log('## DEPENDENCIES & REVERSE DEPENDENCIES');
     console.log(`Outgoing Local Dependencies: ${result.dependencies.length}`);
-    for (const dep of result.dependencies.slice(0, 8)) {
-        console.log(`  ${dep.fromFile} -> ${dep.resolvedFile} (${dep.importedSymbols.join(', ') || '*'})`);
+    for (const dep of result.dependencies) {
+        console.log(
+            `  ${dep.fromFile} -> ${dep.resolvedFile} (${dep.importedSymbols.join(', ') || '*'})`
+        );
     }
     console.log(`Incoming Reverse Dependencies: ${result.reverseDependencies.length}`);
-    for (const rev of result.reverseDependencies.slice(0, 8)) {
-        console.log(`  ${rev.fromFile} -> ${rev.resolvedFile} (${rev.importedSymbols.join(', ') || '*'})`);
+    for (const rev of result.reverseDependencies) {
+        console.log(
+            `  ${rev.fromFile} -> ${rev.resolvedFile} (${rev.importedSymbols.join(', ') || '*'})`
+        );
     }
     console.log('');
 
@@ -95,27 +106,97 @@ export function runExplain(repoRoot: string, task: string, options?: { json?: bo
         console.log('No related tests identified.\n');
     } else {
         for (const t of result.tests) {
-            console.log(`- ${t.testFile} (${t.relationship} via ${t.importedTargetFiles.join(', ') || 'naming'})`);
+            console.log(
+                `- ${t.testFile} (${t.relationship} via ${t.importedTargetFiles.join(', ') || 'naming'})`
+            );
         }
         console.log('');
     }
 
-    console.log('## RELEVANT CODE');
-    if (result.contextPackage.chunks.length === 0) {
-        console.log('No relevant code chunks fit within budget.\n');
+    const packet = result.implementationPacket;
+
+    console.log('## ARCHITECTURAL INVARIANTS');
+    if (packet.architecturalInvariants.length === 0) {
+        console.log('None identified.\n');
     } else {
-        for (const chunk of result.contextPackage.chunks) {
-            console.log(`### ${chunk.path} (Lines ${chunk.startLine}-${chunk.endLine})`);
-            console.log(chunk.content);
-            console.log('---');
+        for (const inv of packet.architecturalInvariants) {
+            console.log(`- ${inv}`);
+        }
+        console.log('');
+    }
+
+    console.log('## IMPLEMENTATION PACKET\n');
+
+    console.log('### PROJECT STATE');
+    console.log(packet.projectState ? `${packet.projectState.trim()}\n` : 'No state files found.\n');
+
+    console.log('### PRIMARY TARGETS');
+    if (packet.targetSurface.primaryTargets.length === 0) {
+        console.log('None.\n');
+    } else {
+        for (const pt of packet.targetSurface.primaryTargets) {
+            const syms = pt.symbolsToModifyOrExtend
+                .map((s) => `${s.name} (${s.kind}, lines ${s.startLine}-${s.endLine})`)
+                .join(', ');
+            console.log(`#### ${pt.filePath} [${pt.role}]`);
+            if (syms) console.log(`  Symbols: ${syms}`);
+            printCodeRanges(pt.codeRanges);
+        }
+        console.log('');
+    }
+
+    if (packet.targetSurface.relevantContext && packet.targetSurface.relevantContext.length > 0) {
+        console.log('### RELEVANT CONTEXT');
+        for (const rc of packet.targetSurface.relevantContext) {
+            const syms = rc.relevantSymbols
+                .map((s) => `${s.name} (${s.kind}, lines ${s.startLine}-${s.endLine})`)
+                .join(', ');
+            console.log(`#### ${rc.filePath} [${rc.role}]`);
+            if (syms) console.log(`  Symbols: ${syms}`);
+            printCodeRanges(rc.codeRanges);
+        }
+        console.log('');
+    }
+
+    console.log('### DEPENDENCIES');
+    if (packet.targetSurface.dependencies.length === 0) {
+        console.log('None.\n');
+    } else {
+        for (const dep of packet.targetSurface.dependencies) {
+            const syms = dep.providedSymbols
+                .map((s) => `${s.name} (${s.kind}, lines ${s.startLine}-${s.endLine})`)
+                .join(', ');
+            console.log(`#### ${dep.filePath} [${dep.role}]`);
+            if (syms) console.log(`  Provided Symbols: ${syms}`);
+            printCodeRanges(dep.codeRanges);
+        }
+        console.log('');
+    }
+
+    console.log('### CALLERS / ENTRY POINTS');
+    if (packet.targetSurface.callersAndEntryPoints.length === 0) {
+        console.log('None.\n');
+    } else {
+        for (const caller of packet.targetSurface.callersAndEntryPoints) {
+            console.log(`#### ${caller.filePath} [${caller.role}]`);
+            printCodeRanges(caller.invocationSites);
+        }
+        console.log('');
+    }
+
+    console.log('### TESTS');
+    if (packet.targetSurface.testTargets.length === 0) {
+        console.log('None.\n');
+    } else {
+        for (const test of packet.targetSurface.testTargets) {
+            console.log(`#### ${test.filePath} [${test.role}, ${test.relationship}]`);
+            printCodeRanges(test.assertionRanges);
         }
         console.log('');
     }
 
     console.log('## CONTEXT BUDGET');
-    console.log(`State: ${result.contextPackage.budgetInfo.stateTokens} tokens`);
-    console.log(`Code:  ${result.contextPackage.budgetInfo.codeTokens} tokens`);
-    console.log(
-        `Total: ${result.contextPackage.budgetInfo.totalTokens} / ${result.contextPackage.budgetInfo.budgetTokens} tokens`
-    );
+    console.log(`State: ${packet.budgetInfo.stateTokens} tokens`);
+    console.log(`Code:  ${packet.budgetInfo.codeTokens} tokens`);
+    console.log(`Total: ${packet.budgetInfo.totalTokens} / ${packet.budgetInfo.budgetTokens} tokens`);
 }

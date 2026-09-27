@@ -1,5 +1,4 @@
-﻿// src/v2/intelligence/index.ts
-import crypto from 'crypto';
+﻿import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { getIgnorer } from '../../core/indexer/ignore';
@@ -312,6 +311,11 @@ export class RepositoryIntelligenceService {
         });
     }
 
+    /**
+     * Identifies genuine application/runtime entry points (CLI binary entry, CLI command handlers,
+     * and MCP server/tool boundaries). Does NOT treat internal subsystem `index.ts` files as
+     * architectural entry points.
+     */
     public findArchitecturalEntryPoints(areaOrFilePath?: string): EntryPointRecord[] {
         this.ensureInitialized();
         const normalizedFilter = areaOrFilePath ? toPosixPath(areaOrFilePath) : undefined;
@@ -337,18 +341,16 @@ export class RepositoryIntelligenceService {
                     kind: 'mcp_entry',
                     reason: 'MCP server and tool registration entrypoint',
                 });
-            } else if (rel.startsWith('src/') && path.basename(rel) === 'index.ts') {
-                entries.push({
-                    filePath: rel,
-                    kind: 'module_index',
-                    reason: 'Subsystem module index entrypoint',
-                });
             }
         }
 
         if (!normalizedFilter) {
             return entries.sort((a, b) => a.filePath.localeCompare(b.filePath));
         }
+
+        const directImporterSet = new Set(
+            this.getImportersOfFile(normalizedFilter).map((e) => e.fromFile)
+        );
 
         const reachableFromTarget = new Set<string>();
         const queue: string[] = [normalizedFilter];
@@ -366,11 +368,15 @@ export class RepositoryIntelligenceService {
         }
 
         return entries
-            .filter(
-                (e) =>
-                    e.filePath.startsWith(normalizedFilter) ||
-                    reachableFromTarget.has(e.filePath)
-            )
+            .filter((e) => {
+                if (e.filePath.startsWith(normalizedFilter)) return true;
+                // CLI command handlers only count as entry points for a target file if they directly import it
+                if (e.kind === 'cli_command') {
+                    return directImporterSet.has(e.filePath);
+                }
+                // Top-level system boundaries (cli_entry, mcp_entry) can be reached transitively
+                return reachableFromTarget.has(e.filePath);
+            })
             .sort((a, b) => a.filePath.localeCompare(b.filePath));
     }
 }
